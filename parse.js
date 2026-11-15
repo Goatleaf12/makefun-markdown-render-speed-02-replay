@@ -240,25 +240,35 @@ function normalizeLabel(label) {
 // Index of the `]` closing the `[` at src[i], respecting backslash escapes
 // and code spans; -1 when the brackets never balance.
 function findBracketEnd(src, i) {
+  return scanBrackets(src, i + 1, 1);
+}
+// Scan from j for the ']' that brings depth to 0, mirroring marked's
+// label regex. A backtick run is tried as a code span first (opening run
+// + content + next backtick run); if that path finds no closer, backtrack
+// to the 2+ run immediately before ']' case. A lone backtick run that is
+// neither invalidates the label.
+function scanBrackets(src, j, depth) {
   const n = src.length;
-  let depth = 0;
-  let j = i;
   while (j < n) {
     const c = src[j];
     if (c === '\\') { j += 2; continue; }
     if (c === '`') {
       let k = j;
       while (k < n && src[k] === '`') k++;
-      // A backtick span pairs with the next backtick run of ANY length
-      // (marked's label regex), so a ']' inside it is not a closer.
+      const run = k - j;
+      // Try the code-span path: the closing run is the next backtick run.
       let m = k;
-      let closed = false;
-      while (m < n) {
-        if (src[m] === '`') { closed = true; while (m < n && src[m] === '`') m++; break; }
-        m++;
+      while (m < n && src[m] !== '`') m++;
+      if (m < n) {
+        let mEnd = m;
+        while (mEnd < n && src[mEnd] === '`') mEnd++;
+        const after = scanBrackets(src, mEnd, depth);
+        if (after !== -1) return after;
       }
-      j = closed ? m : k;
-      continue;
+      // Code-span path failed (or no closing run): a 2+ run immediately
+      // before ']' is valid on its own; fall through to the ']' below.
+      if (run >= 2 && k < n && src[k] === ']') { j = k; continue; }
+      return -1;
     }
     // A '<' that opens an HTML tag or an angle autolink consumes its
     // whole extent, so a ']' inside a quoted attribute or an autolink
@@ -269,10 +279,12 @@ function findBracketEnd(src, i) {
       const auto = matchAngleAutolink(src, j);
       if (auto) { j = auto.end; continue; }
     }
-    if (c === '[') depth++;
-    else if (c === ']') {
+    if (c === '[') { depth++; j++; continue; }
+    if (c === ']') {
       depth--;
       if (depth === 0) return j;
+      j++;
+      continue;
     }
     j++;
   }
@@ -1035,16 +1047,105 @@ function processEmphasis(nodes, src) {
       if (nd.pos < spans[s][1] && e > spans[s][0]) { nd.canOpen = false; nd.canClose = false; break; }
     }
   }
-  const stack = [];
+  // Forward search, left to right, like marked's emStrong: for each
+  // opener, scan forward for a closer. Inner opener runs of the same
+  // char add to the required closer length (m); closers skipped by the
+  // odd-match rule add to f; a closer only pairs once it consumes m.
+  // (A stack that resolves inner pairs first would wrongly pair an
+  // outer opener whose closer search fails in marked, e.g. *a **b**c*.)
+  // If a run cannot open, marked consumes one char as literal text and
+  // retries the shorter run (so **foo* yields *<em>foo</em>).
   let i = 0;
   while (i < nodes.length) {
     const node = nodes[i];
-    if (node.t !== 2) { i++; continue; }
-    if (node.canOpen) {
-      if (last === null) last = lastCloserIdx(maskEmStrong(src));
-      if (last[node.ch] < node.pos + node.n) node.canOpen = false;
-      else stack.push(node);
+    if (node.t !== 2 || !node.canOpen || node.ch === '~') { i++; continue; }
+    if (last === null) last = lastCloserIdx(maskEmStrong(src));
+    if (last[node.ch] < node.pos + node.n) { node.canOpen = false; i++; continue; }
+    const ch = node.ch;
+    if (node.origN === undefined) node.origN = node.n;
+    // o: the char before this run is the same delimiter (a previous
+    // char of the run was already consumed as literal text).
+    const o = node.pos > 0 && src[node.pos - 1] === ch;
+    let m = node.n, f = 0;
+    const y = node.origN;
+    let closerIdx = -1, closerUse = 0;
+    for (let j = i + 1; j < nodes.length; j++) {
+      const d = nodes[j];
+      if (d.t !== 2 || d.ch !== ch) continue;
+      const b = d.n;
+      // A run that cannot close is not a closer candidate: a pure
+      // opener adds to m, a run that can neither open nor close is
+      // ignored entirely (e.g. intraword _).
+      if (!d.canClose) {
+        if (d.canOpen) m += b;
+        continue;
+      }
+      const isBoth = d.canOpen && d.canClose;
+      if (isBoth || node.canClose) {
+        if (o && isBoth) break;
+        if (y % 3 !== 0 && (y + b) % 3 === 0) { f += b; continue; }
+      }
+      m -= b;
+      if (m > 0) continue;
+      closerIdx = j;
+      closerUse = Math.min(b, b + m + f);
+      break;
     }
+    if (closerIdx === -1) {
+      if (node.n > 1) {
+        // Split off one literal char and retry the shorter run.
+        nodes.splice(i, 0, { t: 0, s: ch });
+        node.n -= 1;
+        node.pos += 1;
+        const info = delimInfo(src, node.pos, node.n, ch);
+        node.canOpen = info.canOpen;
+        node.canClose = info.canClose;
+        i++;
+        continue;
+      }
+      i++;
+      continue;
+    }
+    const closer = nodes[closerIdx];
+    const kind = (Math.min(node.n, closerUse) % 2 === 1) ? 'em' : 'strong';
+    const take = kind === 'em' ? 1 : 2;
+    const kids = nodes.slice(i + 1, closerIdx);
+    // Leftover opener chars stay INSIDE the em (at the start of its
+    // inner text, where they may pair with a closer inside, e.g.
+    // ***foo** bar* -> <em><strong>foo</strong> bar</em>).
+    if (node.n > take) {
+      const info = delimInfo(src, node.pos + take, node.n - take, ch);
+      kids.unshift({ t: 2, ch, n: node.n - take, canOpen: info.canOpen, canClose: info.canClose, pos: node.pos + take });
+    }
+    // Closer chars that are part of M (closerUse) but not the delimiter
+    // (take) also stay INSIDE, at the end (e.g. *foo *bar** -> the inner
+    // <em>bar</em> uses the leftover * of the final **).
+    const insideCloser = closerUse - take;
+    if (insideCloser > 0) {
+      const info = delimInfo(src, closer.pos, insideCloser, ch);
+      kids.push({ t: 2, ch, n: insideCloser, canOpen: info.canOpen, canClose: info.canClose, pos: closer.pos });
+    }
+    processEmphasis(kids, src);
+    const emNode = { t: 3, tag: kind, kids };
+    // Closer chars NOT in M go OUTSIDE the em (after it).
+    const replacement = [emNode];
+    const outsideCloser = closer.n - closerUse;
+    if (outsideCloser > 0) {
+      const info = delimInfo(src, closer.pos + closerUse, outsideCloser, ch);
+      replacement.push({ t: 2, ch, n: outsideCloser, canOpen: info.canOpen, canClose: info.canClose, pos: closer.pos + closerUse });
+    }
+    nodes.splice(i, closerIdx - i + 1, ...replacement);
+    // Continue just past the em node (a leftover closer there is
+    // reconsidered as a possible opener by the loop).
+    i = i + 1;
+  }
+  // Strikethrough (~) keeps the stack pairing: equal-length runs only.
+  const stack = [];
+  i = 0;
+  while (i < nodes.length) {
+    const node = nodes[i];
+    if (node.t !== 2 || node.ch !== '~') { i++; continue; }
+    if (node.canOpen) stack.push(node);
     if (node.canClose) {
       let next = -1;
       for (;;) {
@@ -1054,13 +1155,7 @@ function processEmphasis(nodes, src) {
         for (let s = stack.length - 1; s >= 0; s--) {
           const o = stack[s];
           if (o === node) continue;
-          if (o.ch !== node.ch || !o.canOpen) continue;
-          // Strikethrough pairs only equal-length runs (1 with 1, 2
-          // with 2); a 2-run never closes a 1-run or vice versa.
-          if (node.ch === '~' && o.n !== node.n) continue;
-          // Odd-match rule: if either delimiter can both open and close,
-          // the sum of the two run lengths must not be a multiple of 3
-          // unless both lengths are multiples of 3.
+          if (o.ch !== '~' || !o.canOpen || o.n !== node.n) continue;
           if ((o.canOpen && o.canClose) || (node.canOpen && node.canClose)) {
             const sum = o.n + node.n;
             if (sum % 3 === 0 && !(o.n % 3 === 0 && node.n % 3 === 0)) continue;
@@ -1070,12 +1165,12 @@ function processEmphasis(nodes, src) {
           break;
         }
         if (!opener) break;
-        const use = node.ch === '~' ? node.n : ((opener.n >= 2 && node.n >= 2) ? 2 : 1);
-        const kind = node.ch === '~' ? 'del' : (use === 2 ? 'strong' : 'em');
+        const use = node.n;
         const oiIdx = nodes.indexOf(opener);
         const ciIdx = nodes.indexOf(node);
         const kids = nodes.slice(oiIdx + 1, ciIdx);
-        const emNode = { t: 3, tag: kind, kids };
+        processEmphasis(kids, src);
+        const emNode = { t: 3, tag: 'del', kids };
         opener.n -= use;
         node.n -= use;
         stack.length = oi;
