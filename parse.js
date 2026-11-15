@@ -1031,6 +1031,32 @@ function lastCloserIdx(masked) {
   return { '*': star, '_': under, '~': tilde };
 }
 
+function findSkipNode(nodes, i, ch) {
+  // marked's emStrong closer regex starts with a skip alternative:
+  //   ^[^_*]*?__[^_*]*?\*[^_*]*?(?=__)   (for a * search)
+  //   ^[^_*]*?\*\*[^_*]*?_[^_*]*?(?=\*\*) (for a _ search)
+  // A delimiter of the searched char that lies inside such a span at the
+  // very start of the search is hidden from the m accounting (the regex
+  // consumes it as part of the skipped prefix). The opener run must be
+  // exactly 2 (a longer run leaves a stray delimiter char the [^_*]*?
+  // cannot cross), the middle run exactly 1, the closer 2+.
+  const other = ch === '*' ? '_' : '*';
+  let j = i + 1;
+  while (j < nodes.length && nodes[j].t !== 2) j++;
+  if (j >= nodes.length) return -1;
+  if (nodes[j].ch !== other || nodes[j].n !== 2) return -1;
+  j++;
+  while (j < nodes.length && nodes[j].t !== 2) j++;
+  if (j >= nodes.length) return -1;
+  const midIdx = j;
+  if (nodes[j].ch !== ch || nodes[j].n !== 1) return -1;
+  j++;
+  while (j < nodes.length && nodes[j].t !== 2) j++;
+  if (j >= nodes.length) return -1;
+  if (nodes[j].ch !== other || nodes[j].n < 2) return -1;
+  return midIdx;
+}
+
 function processEmphasis(nodes, src) {
   // Marked's ze() bound: an opener can only pair if a possible closer for
   // its char exists at/after the opener's end in the masked source.
@@ -1069,9 +1095,14 @@ function processEmphasis(nodes, src) {
     let m = node.n, f = 0;
     const y = node.origN;
     let closerIdx = -1, closerUse = 0;
+    // A delimiter hidden by the closer regex's leading skip (a * inside
+    // a __...__ span, or a _ inside a **...** span, at the start of the
+    // search) does not count in the m accounting at all.
+    const skipIdx = findSkipNode(nodes, i, ch);
     for (let j = i + 1; j < nodes.length; j++) {
       const d = nodes[j];
       if (d.t !== 2 || d.ch !== ch) continue;
+      if (j === skipIdx) continue;
       const b = d.n;
       // A run that cannot close is not a closer candidate: a pure
       // opener adds to m, a run that can neither open nor close is
