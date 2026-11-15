@@ -1490,7 +1490,7 @@ function htmlBlockType(s) {
 }
 
 // Does this line start a block construct (used for lazy continuation checks)?
-function isBlockStartLine(line) {
+function isBlockStartLine(line, strictFence) {
   if (setextLevel(line) > 0) return false;
   const ind = indentOf(line);
   if (ind > 3) return false;
@@ -1499,9 +1499,17 @@ function isBlockStartLine(line) {
   const c = s[0];
   if (c === '#') return atxLevel(s) > 0;
   if (c === '`' || c === '~') {
+    // Loose (default): marked's fencesBeginRegex is just
+    // /^ {0,R}(?:```|~~~)/ — it does NOT check the info string, so a
+    // backtick fence whose info contains a backtick still ends a lazy
+    // continuation (it just is not a fence BLOCK — parseBlocks has its
+    // own strict check for that and falls through to a paragraph with
+    // code spans). Strict (trackLine): the paragraph regex's fences is
+    // `{3,}(?=[^`\n]*(?:\n|$))`, so such a line is paragraph text and
+    // does NOT end the paragraph being tracked.
     const f = fenceInfo(s);
     if (!f) return false;
-    if (f.ch === '`' && f.info.indexOf('`') !== -1) return false;
+    if (strictFence && f.ch === '`' && f.info.indexOf('`') !== -1) return false;
     return true;
   }
   if (c === '>') return true;
@@ -1528,6 +1536,11 @@ function interruptsParagraph(line, st) {
   const c = s[0];
   if (c === '#') return atxLevel(s) > 0;
   if (c === '`' || c === '~') {
+    // STRICT here: the paragraph regex's fences is
+    // `{3,}(?=[^`\n]*(?:\n|$))` — a backtick fence whose info contains a
+    // backtick does NOT interrupt a paragraph (it stays paragraph text
+    // with code spans). The lazy-continuation check (isBlockStartLine)
+    // is loose; this one is not.
     const f = fenceInfo(s);
     if (!f) return false;
     if (f.ch === '`' && f.info.indexOf('`') !== -1) return false;
@@ -1843,7 +1856,7 @@ function trackLine(state, rest, inList) {
       return;
     }
   }
-  if (isBlockStartLine(rest)) {
+  if (isBlockStartLine(rest, true)) {
     state.endsWithParagraph = false;
   } else if (state.lastWasBlank && indentOf(rest) >= 4) {
     state.endsWithParagraph = false;
@@ -1956,12 +1969,13 @@ function parseBlockquote(lines, i, b, st) {
     // that group (the nested container re-lexes with it included); if
     // it ends in a code block, heading, hr, html block or table, the
     // quote ends here and the line is not consumed.
-    // Lazy continuation of an open paragraph. Marked's blockquote
-    // regex excludes list-start lines from lazy continuation (Ke):
-    // a bullet or ordered marker followed by a space/tab or end of
-    // line — including a lone '-' (an empty item), which
-    // isBlockStartLine misses because it reads as a setext underline.
-    if (state.endsWithParagraph && !isBlockStartLine(line) && !/^ {0,3}(?:[*+-]|\d{1,9}[.)])(?:[ \t]|$)/.test(line) && !(ind <= 3 && isHr(line.slice(firstNonWs(line))))) {
+    // Lazy continuation of an open paragraph. The blockquote lazy check
+    // uses the STRICT fence rule (the paragraph regex's fences, where a
+    // backtick fence whose info contains a backtick is paragraph text),
+    // NOT the loose fencesBeginRegex the list tokenizer uses — so a
+    // lazy ```inner backticks``` line joins the quote's paragraph, while
+    // a real fence (````) ends it.
+    if (state.endsWithParagraph && !isBlockStartLine(line, true) && !/^ {0,3}(?:[*+-]|\d{1,9}[.)])(?:[ \t]|$)/.test(line) && !(ind <= 3 && isHr(line.slice(firstNonWs(line))))) {
       // Marked's blockquoteSetextReplace: a lazy setext-underline line
       // (0-3 spaces, a run of '=' or '-', only spaces/tabs after) that
       // is not the first line of its group is indented to 4 spaces, so
@@ -2152,7 +2166,6 @@ function parseList(lines, i, b, st) {
   const delim = first.delim;
   const items = [];
   let j = i;
-  let loose = false;
   let sawBlankBetween = false;
   while (j < b) {
     const line = lines[j];
@@ -2247,57 +2260,29 @@ function parseList(lines, i, b, st) {
     break;
   }
   if (items.length === 0) return { node: null, next: i + 1 };
+  // Loose is NOT decided here from raw lines: a blank line inside a
+  // nested list/quote/fence belongs to that nested container, not to
+  // this list (marked decides loose from the item's block tokens — a
+  // space token at the item's top level). renderList parses each item's
+  // blocks and sets loose from the top-level blank separators there.
   for (let t = 0; t < items.length; t++) {
     const ls = items[t].lines;
     while (ls.length > 0 && ls[ls.length - 1] === '') ls.pop();
-    // A leading empty first line (empty marker) is not a blank separator.
-    const startU = ls.length > 0 && ls[0] === '' ? 1 : 0;
-    // Track fenced code state: blanks inside a fence are code content,
-    // not block separators.
-    let inFence = false;
-    let fenceCh = '';
-    let fenceLen = 0;
-    for (let u = startU; u < ls.length; u++) {
-      const lu = ls[u];
-      if (!inFence) {
-        const f = indentOf(lu) <= 3 ? fenceInfo(lu.slice(firstNonWs(lu))) : null;
-        if (f && !(f.ch === '`' && f.info.indexOf('`') !== -1)) {
-          inFence = true;
-          fenceCh = f.ch;
-          fenceLen = f.len;
-        }
-      } else if (isFenceClose(lu, fenceCh, fenceLen)) {
-        inFence = false;
-      }
-      if (inFence || lu !== '') continue;
-      // Blank line (not in a fence): a separator unless the line before
-      // it is nested content.
-      let v = u + 1;
-      while (v < ls.length && ls[v] === '') v++;
-      if (v < ls.length) {
-        let w = u - 1;
-        while (w >= 0 && ls[w] === '') w--;
-        const bw = w >= 0 ? ls[w] : '';
-        const beforeNested = w >= 0 && (indentOf(bw) >= items[t].thresh || matchListMarker(bw) !== null);
-        // The blank is inside nested content only when the line before
-        // it is nested AND the following line runs deeper (a continuation
-        // of that nested block); otherwise it separates top-level blocks.
-        const runsDeeper = beforeNested && indentOf(ls[v]) > indentOf(bw);
-        if (!runsDeeper) { loose = true; break; }
-      }
-      u = v - 1;
-    }
-    if (loose) break;
   }
-  if (sawBlankBetween) loose = true;
-  return { node: { k: 'list', ordered, start: first.start, loose, items: items.map((it) => it.lines) }, next: j };
+  return { node: { k: 'list', ordered, start: first.start, sawBlankBetween, items: items.map((it) => it.lines) }, next: j };
 }
-function parseBlocks(lines, a, b, st) {
+function parseBlocks(lines, a, b, st, tracker) {
   const out = [];
   let i = a;
+  // tracker (optional, only from renderList): records whether a blank
+  // line separated two top-level blocks here — marked's space token at
+  // the item's top level, which makes the enclosing list loose.
+  let sawBlank = false;
   while (i < b) {
     const line = lines[i];
-    if (isBlank(line)) { i++; continue; }
+    if (isBlank(line)) { sawBlank = true; i++; continue; }
+    if (sawBlank && out.length > 0 && tracker) tracker.hadBlankSep = true;
+    sawBlank = false;
     const ind = indentOf(line);
     const s = line.slice(firstNonWs(line));
     if (ind <= 3) {
@@ -2464,7 +2449,7 @@ function renderTable(blk, st) {
   return out;
 }
 
-function renderListItem(itemLines, st, loose) {
+function parseListItem(itemLines, st, tracker) {
   let lines = itemLines;
   let task = null;
   if (lines.length > 0) {
@@ -2482,8 +2467,14 @@ function renderListItem(itemLines, st, loose) {
   // start number (marked); parseBlocks is given that context here.
   st.listDepth = (st.listDepth || 0) + 1;
   let blocks;
-  try { blocks = parseBlocks(lines, 0, lines.length, st); }
+  try { blocks = parseBlocks(lines, 0, lines.length, st, tracker); }
   finally { st.listDepth--; }
+  return { blocks, task };
+}
+
+function renderListItemParsed(parsed, st, loose) {
+  const blocks = parsed.blocks;
+  const task = parsed.task;
   if (blocks.length === 0) {
     if (task) return `<li><input${task === 'x' ? ' checked=""' : ''} disabled="" type="checkbox"></li>\n`;
     return `<li></li>\n`;
@@ -2508,9 +2499,21 @@ function renderListItem(itemLines, st, loose) {
 function renderList(node, st) {
   const tag = node.ordered ? 'ol' : 'ul';
   const start = node.ordered && node.start !== 1 ? ` start="${node.start}"` : '';
-  let out = `<${tag}${start}>\n`;
+  // Parse every item's blocks first: loose depends on whether any item
+  // has a blank line between two of its top-level blocks (the tracker's
+  // hadBlankSep, i.e. marked's space token at the item's top level), or
+  // items are separated by blank lines (sawBlankBetween).
+  const parsed = [];
+  let loose = !!node.sawBlankBetween;
   for (let t = 0; t < node.items.length; t++) {
-    out += renderListItem(node.items[t], st, node.loose);
+    const tracker = { hadBlankSep: false };
+    const p = parseListItem(node.items[t], st, tracker);
+    if (tracker.hadBlankSep) loose = true;
+    parsed.push(p);
+  }
+  let out = `<${tag}${start}>\n`;
+  for (let t = 0; t < parsed.length; t++) {
+    out += renderListItemParsed(parsed[t], st, loose);
   }
   out += `</${tag}>\n`;
   return out;
