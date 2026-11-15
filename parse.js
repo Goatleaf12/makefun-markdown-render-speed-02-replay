@@ -351,8 +351,31 @@ function parseInlineLink(src, j) {
 function labelHasLink(labelText, links) {
   for (let k = 0; k < labelText.length; k++) {
     if (labelText[k] !== '[') continue;
-    if (k > 0 && labelText[k - 1] === '!') continue;
     if (k > 0 && labelText[k - 1] === '\\') continue;
+    // An image reference ![alt][ref] / ![alt](dest) / ![alt] is not a
+    // link: skip the whole image, including its [ref] / (dest) part,
+    // so the [ref] of ![command][6] is not mistaken for a standalone
+    // link inside the label.
+    if (k > 0 && labelText[k - 1] === '!') {
+      const altEnd = findBracketEnd(labelText, k);
+      if (altEnd !== -1) {
+        let m = altEnd + 1;
+        if (labelText[m] === '[') {
+          const refEnd = findBracketEnd(labelText, m);
+          if (refEnd !== -1) { k = refEnd; continue; }
+        } else if (labelText[m] === '(') {
+          let depth = 0, p = m;
+          while (p < labelText.length) {
+            if (labelText[p] === '(') depth++;
+            else if (labelText[p] === ')') { depth--; if (depth === 0) break; }
+            p++;
+          }
+          if (p < labelText.length) { k = p; continue; }
+        }
+        k = altEnd;
+      }
+      continue;
+    }
     if (tryLink(labelText, k, links, false)) return true;
   }
   return false;
@@ -2200,6 +2223,21 @@ function parseList(lines, i, b, st) {
   let sawBlankBetween = false;
   while (j < b) {
     const line = lines[j];
+    // While a fenced code block is open inside the current item, every
+    // line is item content (fence content or the closing fence)
+    // regardless of indent — marked's list tokenizer consumes fence
+    // lines as code until the closing fence. This also covers blank
+    // lines inside the fence (they are code content, not separators).
+    // sliceAtCol never eats content when the indent is shorter than
+    // the item width, so an indent-0 code line stays verbatim.
+    if (items.length > 0 && items[items.length - 1].state.inFence) {
+      const cont = items[items.length - 1];
+      const rest = sliceAtCol(expandLeadTabs(line), cont.width);
+      cont.lines.push(rest);
+      trackLine(cont.state, rest, true);
+      j++;
+      continue;
+    }
     if (isBlank(line)) {
       let k = j + 1;
       while (k < b && isBlank(lines[k])) k++;
