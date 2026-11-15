@@ -249,16 +249,13 @@ function findBracketEnd(src, i) {
     if (c === '`') {
       let k = j;
       while (k < n && src[k] === '`') k++;
-      const run = k - j;
+      // A backtick span pairs with the next backtick run of ANY length
+      // (marked's label regex), so a ']' inside it is not a closer.
       let m = k;
       let closed = false;
       while (m < n) {
-        if (src[m] === '`') {
-          let q = m;
-          while (q < n && src[q] === '`') q++;
-          if (q - m === run) { closed = true; m = q; break; }
-          m = q;
-        } else m++;
+        if (src[m] === '`') { closed = true; while (m < n && src[m] === '`') m++; break; }
+        m++;
       }
       j = closed ? m : k;
       continue;
@@ -349,10 +346,61 @@ function labelHasLink(labelText, links) {
   return false;
 }
 
+// Whether a link label's backtick runs satisfy marked's label regex:
+// at the top level of the label, backtick runs must pair up (any
+// lengths), or be a 2+ run immediately before the closing ']'. Runs
+// inside a nested [...] group or after a backslash need no pairing.
+function labelBackticksOk(label) {
+  const n = label.length;
+  let i = 0;
+  while (i < n) {
+    const c = label[i];
+    if (c === '\\' && i + 1 < n) { i += 2; continue; }
+    if (c === '[') {
+      // Skip a nested [...] group (its backticks need no pairing).
+      let depth = 1;
+      let j = i + 1;
+      let ok = false;
+      while (j < n) {
+        const cj = label[j];
+        if (cj === '\\' && j + 1 < n) { j += 2; continue; }
+        if (cj === '[') depth++;
+        else if (cj === ']') { depth--; if (depth === 0) { ok = true; break; } }
+        j++;
+      }
+      if (!ok) return false;
+      i = j + 1;
+      continue;
+    }
+    if (c === '`') {
+      let run = 0;
+      while (i + run < n && label[i + run] === '`') run++;
+      // A 2+ run immediately before the closing ']' is valid on its own.
+      if (run >= 2 && i + run === n) return true;
+      // Find the next backtick run (any length); brackets between the
+      // runs are ordinary characters for the pairing alternative.
+      let j = i + run;
+      while (j < n) {
+        if (label[j] === '\\' && j + 1 < n) { j += 2; continue; }
+        if (label[j] === '`') break;
+        j++;
+      }
+      if (j >= n) return false;
+      let run2 = 0;
+      while (j + run2 < n && label[j + run2] === '`') run2++;
+      i = j + run2;
+      continue;
+    }
+    i++;
+  }
+  return true;
+}
+
 function tryLink(src, i, links, isImage) {
   const close = findBracketEnd(src, i);
   if (close === -1) return null;
   const labelText = src.slice(i + 1, close);
+  if (!labelBackticksOk(labelText)) return null;
   if (!isImage && labelHasLink(labelText, links)) return null;
   const j = close + 1;
   if (src[j] === '(') {
@@ -558,33 +606,44 @@ function scanUrlRun(s, i) {
   let j = i;
   while (j < n) {
     const c = s[j];
-    if (isWsChar(c) || c === '<' || c === '>' || c === '[' || c === ']') break;
+    if (isWsChar(c) || c === '<') break;
     j++;
   }
   return s.slice(i, j);
 }
 
-// Trim trailing punctuation, a trailing entity reference, and unbalanced ')'.
+// marked's _backpedal: the longest prefix made of safe runs, balanced
+// parenthesised groups, '&' not starting a trailing entity, and
+// punctuation runs that are not at the very end. Reimplemented as a
+// forward scan over the same alternatives.
 function trimUrl(url) {
-  let end = url.length;
-  while (end > 0) {
-    const last = url[end - 1];
-    if (last === ';') {
-      const amp = url.lastIndexOf('&', end - 1);
-      if (amp !== -1 && /^&[A-Za-z0-9_]+;$/.test(url.slice(amp, end))) { end = amp; continue; }
+  const n = url.length;
+  let end = 0;
+  while (end < n) {
+    const c = url[end];
+    if (c === '(') {
+      const close = url.indexOf(')', end + 1);
+      if (close === -1) break;
+      end = close + 1;
+      continue;
     }
-    if (last === '?' || last === '!' || last === '.' || last === ',' || last === ':' || last === ';'
-      || last === '*' || last === '_' || last === '~' || last === "'" || last === '"') { end--; continue; }
-    if (last === ')') {
-      let open = 0;
-      let close = 0;
-      for (let k = 0; k < end; k++) {
-        if (url[k] === '(') open++;
-        else if (url[k] === ')') close++;
-      }
-      if (close > open) { end--; continue; }
+    if (c === '&') {
+      const m = /^&[A-Za-z0-9]+;/.exec(url.slice(end));
+      if (m && end + m[0].length === n) break;
+      end++;
+      continue;
     }
-    break;
+    if (c === '?' || c === '!' || c === '.' || c === ',' || c === ':' || c === ';'
+      || c === '*' || c === '_' || c === "'" || c === '"' || c === '~' || c === ')') {
+      let k = end;
+      while (k < n && (url[k] === '?' || url[k] === '!' || url[k] === '.' || url[k] === ','
+        || url[k] === ':' || url[k] === ';' || url[k] === '*' || url[k] === '_'
+        || url[k] === "'" || url[k] === '"' || url[k] === '~' || url[k] === ')')) k++;
+      if (k === n) break;
+      end = k;
+      continue;
+    }
+    end++;
   }
   return url.slice(0, end);
 }
@@ -740,7 +799,9 @@ function tokenize(src, links, inLink) {
         textStart = i;
         continue;
       }
-      const auto = !inLink ? matchAngleAutolink(src, i) : null;
+      // Angle autolinks render inside link text too (marked does not
+      // suppress them); bare GFM autolinks and bare emails do not.
+      const auto = matchAngleAutolink(src, i);
       if (auto) {
         flushText(i);
         nodes.push({ t: 9, href: auto.href, text: auto.text });
@@ -923,7 +984,12 @@ function renderNodes(nodes, links, inLink) {
       out += '<img src="' + escAttr(node.href) + '" alt="' + plainText(node.text, links) + '"';
       if (node.title !== null) out += ' title="' + escAttr(node.title) + '"';
       out += '>';
-    } else if (node.t === 9) out += '<a href="' + escAttr(node.href) + '">' + escAttr(node.text) + '</a>';
+    } else if (node.t === 9) {
+      // marked's link renderer cleanUrls the href (GFM autolinks are
+      // not cleaned at tokenize time); a null result renders as text.
+      const href = cleanUrl(node.href);
+      out += href === null ? esc(node.text) : '<a href="' + esc(href) + '">' + esc(node.text) + '</a>';
+    }
     else if (node.t === 10) out += '<del>' + inline(node.text, links, inLink) + '</del>';
   }
   return out;
@@ -1205,7 +1271,7 @@ function isBlockStartLine(line) {
 }
 
 // Can this line interrupt a paragraph (stricter list rules apply)?
-function interruptsParagraph(line) {
+function interruptsParagraph(line, st) {
   if (setextLevel(line) > 0) return false;
   const ind = indentOf(line);
   if (ind > 3) return false;
@@ -1232,7 +1298,9 @@ function interruptsParagraph(line) {
   }
   if (c >= '0' && c <= '9') {
     const m = matchListMarker(line);
-    if (m && !m.empty && m.start === 1) return true;
+    // An ordered list interrupts a paragraph only for start 1 at top
+    // level; inside a list item (st.listDepth > 0) any start number does.
+    if (m && !m.empty && (m.start === 1 || (st && st.listDepth > 0))) return true;
     return false;
   }
   return false;
@@ -1499,6 +1567,17 @@ function trackLine(state, rest) {
       return;
     }
   }
+  // A list line: the paragraph state depends on the item's first
+  // content (and through nested quotes), so recurse into it. An empty
+  // item ends the paragraph.
+  if (indentOf(rest) <= 3) {
+    const lm = matchListMarker(rest);
+    if (lm) {
+      if (lm.empty) { state.endsWithParagraph = false; state.lastWasBlank = false; return; }
+      trackLine(state, lm.firstContent);
+      return;
+    }
+  }
   if (indentOf(rest) <= 3) {
     const f = fenceInfo(rest.slice(firstNonWs(rest)));
     if (f && !(f.ch === '`' && f.info.indexOf('`') !== -1)) {
@@ -1620,23 +1699,57 @@ function trimPipes(line) {
   return s;
 }
 
+function isIndentedCodeStart(line) {
+  // A line whose content starts at column 4+ (spaces or a tab at 0-3
+  // columns): an indented code block start in marked's table regex.
+  if (firstNonWs(line) >= line.length) return false;
+  return indentOf(line) >= 4;
+}
+
 function parseParagraph(lines, i, b, st) {
   const paraLines = [];
   let j = i;
+  // Soft breaks: lines that end a plain paragraph but are table rows
+  // (tab-only blank lines; any-start ordered lists inside a list item).
+  // They are collected and the paragraph is truncated at the first one
+  // once the paragraph turns out not to be a table.
+  let tabOnlyIdx = -1;
+  let ordIdx = -1;
   while (j < b) {
     const line = lines[j];
-    // A blank line ends the paragraph, except a non-empty whitespace-only
-    // line that is the last line of the input (trailing whitespace of the
-    // paragraph). An empty last line is just the trailing-newline marker.
-    if (isBlank(line) && (j < b - 1 || line === '')) break;
+    if (isBlank(line)) {
+      // A blank line ends the paragraph, except a non-empty
+      // whitespace-only line that is the last line of the input
+      // (trailing whitespace of the paragraph). An empty last line is
+      // just the trailing-newline marker. A tab-only blank line is a
+      // table row, not a paragraph break.
+      const tabOnly = line.indexOf('\t') !== -1;
+      if (!tabOnly && (j < b - 1 || line === '')) break;
+      if (tabOnly && tabOnlyIdx === -1) tabOnlyIdx = paraLines.length;
+      paraLines.push(line);
+      j++;
+      continue;
+    }
     if (paraLines.length > 0 && setextLevel(line) > 0) break;
-    if (paraLines.length > 0 && interruptsParagraph(line)) break;
+    if (paraLines.length > 0 && interruptsParagraph(line, st)) {
+      // An ordered list with a start other than 1 inside a list item
+      // interrupts a plain paragraph but is a table row.
+      const m = matchListMarker(line);
+      if (m && m.ordered && !m.empty && m.start !== 1 && st && st.listDepth > 0) {
+        if (ordIdx === -1) ordIdx = paraLines.length;
+        paraLines.push(line);
+        j++;
+        continue;
+      }
+      break;
+    }
     paraLines.push(line);
     j++;
   }
-  const rest = stripDefs(paraLines.join(NL), st.links);
+  let rest = stripDefs(paraLines.join(NL), st.links);
   if (rest === '') return { node: null, next: j };
-  const restLines = rest.split(NL);
+  let restLines = rest.split(NL);
+  const removed = paraLines.length - restLines.length;
   if (restLines.length >= 2) {
     const aligns = isDelimRow(restLines[1]);
     if (aligns) {
@@ -1651,7 +1764,11 @@ function parseParagraph(lines, i, b, st) {
         header.push(c < headerCells.length ? headerCells[c].trim() : '');
       }
       const rows = [];
+      let endJ = j;
       for (let r = 2; r < restLines.length; r++) {
+        // An indented-code line ends the table; it (and what follows)
+        // is parsed as new blocks.
+        if (isIndentedCodeStart(restLines[r])) { endJ = i + r + removed; break; }
         const cells = splitCells(trimPipes(restLines[r]));
         const row = [];
         for (let c = 0; c < aligns.length; c++) {
@@ -1659,9 +1776,20 @@ function parseParagraph(lines, i, b, st) {
         }
         rows.push(row);
       }
-      return { node: { k: 'table', header, aligns, rows }, next: j };
+      return { node: { k: 'table', header, aligns, rows }, next: endJ };
       }
     }
+  }
+  // Not a table: truncate at the first soft break.
+  let cut = -1;
+  if (tabOnlyIdx !== -1) cut = tabOnlyIdx;
+  if (ordIdx !== -1 && (cut === -1 || ordIdx < cut)) cut = ordIdx;
+  if (cut !== -1) {
+    const trunc = paraLines.slice(0, cut);
+    rest = stripDefs(trunc.join(NL), st.links);
+    if (rest === '') return { node: null, next: i + cut };
+    restLines = rest.split(NL);
+    j = i + cut;
   }
   if (j < b && setextLevel(lines[j]) > 0) {
     // A setext heading strips leading whitespace from its first line and
@@ -1734,9 +1862,9 @@ function parseList(lines, i, b, st) {
       // the list instead. A list marker line is never lazy: it starts a
       // new item even when it also reads as a setext underline ('-').
       if (cont.state.endsWithParagraph && !isBlockStartLine(line) && !matchListMarker(line) && !(indentOf(line) <= 3 && isHr(line.slice(firstNonWs(line))))) {
-        // A lazy line joins the item's content with the item indent
-        // removed, like a continuation.
-        let add = sliceAtCol(line, cont.width);
+        // A lazy line joins the item's content verbatim (marked keeps
+        // its original indent); it is not stripped to the item indent.
+        let add = line;
         if (setextLevel(add) === 1) add = neutralizeLazySetext(add, false);
         // A lazy line that reads as a list marker must stay paragraph
         // text, not start a nested list when the content is re-parsed.
@@ -1845,7 +1973,9 @@ function parseBlocks(lines, a, b, st) {
               if (k >= fence.len && isAllWs(s2.slice(k))) break;
             }
           }
-          content.push(stripIndentN(l2, ind));
+          // Fenced code content is verbatim: marked does not strip the
+          // fence's indent (tabs stay tabs, leading spaces stay).
+          content.push(l2);
           j++;
         }
         out.push({ k: 'code', lang: unescapePunct(langOf(fence.info)), text: content.length > 0 ? content.join(NL) + (content[content.length - 1] !== '' ? NL : '') : '' });
@@ -1996,7 +2126,12 @@ function renderListItem(itemLines, st, loose) {
       }
     }
   }
-  const blocks = parseBlocks(lines, 0, lines.length, st);
+  // Inside a list item, an ordered list interrupts a paragraph for any
+  // start number (marked); parseBlocks is given that context here.
+  st.listDepth = (st.listDepth || 0) + 1;
+  let blocks;
+  try { blocks = parseBlocks(lines, 0, lines.length, st); }
+  finally { st.listDepth--; }
   if (blocks.length === 0) {
     if (task) return `<li><input${task === 'x' ? ' checked=""' : ''} disabled="" type="checkbox"></li>\n`;
     return `<li></li>\n`;
@@ -2082,7 +2217,11 @@ function collectDefs(blocks, st) {
       collectDefs(parseBlocks(blk.lines, 0, blk.lines.length, st), st);
     } else if (blk.k === 'list') {
       for (let t = 0; t < blk.items.length; t++) {
-        collectDefs(parseBlocks(blk.items[t], 0, blk.items[t].length, st), st);
+        // Item contents are parsed with list context (any-start ordered
+        // lists interrupt paragraphs there).
+        st.listDepth = (st.listDepth || 0) + 1;
+        try { collectDefs(parseBlocks(blk.items[t], 0, blk.items[t].length, st), st); }
+        finally { st.listDepth--; }
       }
     }
   }
