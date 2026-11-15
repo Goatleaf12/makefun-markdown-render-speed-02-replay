@@ -13,6 +13,15 @@ const BLOCK_TAGS = new Set(('address article aside base basefont blockquote body
 // A newline character, built without an escape sequence in this source.
 const NL = String.fromCharCode(10);
 
+// Document-level "inside a link" flag, mirroring marked's Lexer.state
+// .inLink. An inline `<a ` start tag sets it; a `</a>` end tag clears it.
+// It persists across paragraphs (it is NOT reset per inline call) and
+// suppresses bare GFM autolinks (URLs and emails) only — explicit
+// [...](...) / reference links and angle autolinks still form. It is saved
+// and restored around link-label and image-alt tokenization (marked's link
+// tokenizer restores it after the label). Reset at the start of parse().
+let docInLink = false;
+
 // ASCII punctuation, by code point, for backslash escapes and flanking tests.
 const PUNCT = new Uint8Array(128);
 for (const ch of '!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~') PUNCT[ch.charCodeAt(0)] = 1;
@@ -847,11 +856,15 @@ function tokenize(src, links, inLink) {
       while (spanIdx < emailSpans.length && emailSpans[spanIdx].end <= i) spanIdx++;
       if (spanIdx < emailSpans.length && emailSpans[spanIdx].start === i) {
         const sp = emailSpans[spanIdx];
+        spanIdx++;
+        // A bare email is not autolinked while inside a link (a preceding
+        // inline `<a ` tag sets docInLink for the rest of the document
+        // until a `</a>`); it stays plain text.
+        if (docInLink) continue;
         flushText(i);
         nodes.push({ t: 9, href: 'mailto:' + sp.email, text: sp.email });
         i = sp.end;
         textStart = i;
-        spanIdx++;
         continue;
       }
     }
@@ -905,8 +918,17 @@ function tokenize(src, links, inLink) {
     if (c === '<') {
       const tag = matchHtmlTag(src, i);
       if (tag) {
+        // marked's tag tokenizer tracks inLink: an `<a ` start tag opens
+        // it (persists across paragraphs), `</a>` closes it. startATag
+        // requires a space after `a`, so `<a>` / `<a/>` do not count.
+        const tagText = src.slice(i, tag.end);
+        if (tagText.charCodeAt(1) === 97 || tagText.charCodeAt(1) === 65) {
+          if (tagText.charCodeAt(2) === 32) docInLink = true;
+        } else if (tagText.charCodeAt(1) === 47 && (tagText.charCodeAt(2) === 97 || tagText.charCodeAt(2) === 65) && tagText.charCodeAt(3) === 62) {
+          docInLink = false;
+        }
         flushText(i);
-        nodes.push({ t: 1, s: src.slice(i, tag.end) });
+        nodes.push({ t: 1, s: tagText });
         i = tag.end;
         textStart = i;
         continue;
@@ -990,7 +1012,7 @@ function tokenize(src, links, inLink) {
       i++;
       continue;
     }
-    if ((c === 'w' || c === 'W' || c === 'h' || c === 'H' || c === 'f' || c === 'F' || c === 'm' || c === 'M' || c === 'x' || c === 'X') && !inLink) {
+    if ((c === 'w' || c === 'W' || c === 'h' || c === 'H' || c === 'f' || c === 'F' || c === 'm' || c === 'M' || c === 'x' || c === 'X') && !inLink && !docInLink) {
       const prev = i > 0 ? src[i - 1] : '';
       const g = tryGfmAutolink(src, i, prev);
       if (g) {
@@ -1264,9 +1286,15 @@ function renderNodes(nodes, links, inLink) {
     else if (node.t === 5) out += '<br>';
     else if (node.t === 6) out += '<code>' + esc(node.s) + '</code>';
     else if (node.t === 7) {
+      // A link label is tokenized with inLink set; marked's link
+      // tokenizer restores the document inLink afterwards, so an `<a>`
+      // inside the label does not leak into later paragraphs.
+      const saved = docInLink;
+      const label = inline(node.text, links, true);
+      docInLink = saved;
       out += '<a href="' + escAttr(node.href) + '"';
       if (node.title !== null) out += ' title="' + escAttr(node.title) + '"';
-      out += '>' + inline(node.text, links, true) + '</a>';
+      out += '>' + label + '</a>';
     } else if (node.t === 8) {
       out += '<img src="' + escAttr(node.href) + '" alt="' + plainText(node.text, links) + '"';
       if (node.title !== null) out += ' title="' + escAttr(node.title) + '"';
@@ -1304,9 +1332,14 @@ function renderPlain(nodes, links) {
 // Plain text of inline content, as used for image alt text: formatting is
 // stripped, raw HTML is escaped, links and images contribute their text.
 function plainText(src, links) {
+  // Image alt text is tokenized like a link label: the document inLink
+  // is restored afterwards.
+  const saved = docInLink;
   const nodes = tokenize(src, links, false);
   processEmphasis(nodes, src);
-  return renderPlain(nodes, links);
+  const out = renderPlain(nodes, links);
+  docInLink = saved;
+  return out;
 }
 
 function inline(src, links, inLink) {
@@ -1858,6 +1891,18 @@ function isFenceClose(s, ch, len) {
   return isAllWs(t.slice(k));
 }
 
+// Whether a line looks like a fence (3+ backticks or tildes at its start,
+// after at most 3 leading spaces) — regardless of whether it would close
+// the currently open fence or carries info text. Marked's list tokenizer
+// breaks the item on any such line whose indent is below the item's
+// content indent.
+function isFenceLike(s) {
+  if (indentOf(s) > 3) return false;
+  const t = s.slice(firstNonWs(s));
+  const c = t[0];
+  return (c === '`' || c === '~') && t[1] === c && t[2] === c;
+}
+
 // Tracks whether the content added so far ends with an open paragraph, for
 // lazy continuation lines. state: { inFence, fenceCh, fenceLen,
 // endsWithParagraph, lastWasBlank }. inList is true for list-item content:
@@ -1872,6 +1917,7 @@ function trackLine(state, rest, inList) {
   }
   if (state.inFence) {
     if (isFenceClose(rest, state.fenceCh, state.fenceLen)) state.inFence = false;
+    else state.fenceFresh = false;
     state.endsWithParagraph = false;
     state.lastWasBlank = false;
     return;
@@ -1905,6 +1951,10 @@ function trackLine(state, rest, inList) {
       state.inFence = true;
       state.fenceCh = f.ch;
       state.fenceLen = f.len;
+      // A fence is "fresh" until its first non-blank content line at
+      // the item indent arrives; before that, an under-indented line
+      // ends the item (marked's lazy check after a fence begin).
+      state.fenceFresh = true;
       state.endsWithParagraph = false;
       state.lastWasBlank = false;
       return;
@@ -1987,7 +2037,7 @@ function parseBlockquote(lines, i, b, st) {
   let group = [];
   let groupHasQ = false;
   let j = i;
-  const state = { inFence: false, fenceCh: '', fenceLen: 0, endsWithParagraph: false, lastWasBlank: true };
+  const state = { inFence: false, fenceCh: '', fenceLen: 0, fenceFresh: false, endsWithParagraph: false, lastWasBlank: true };
   // Close the current group: parse its lines and merge the blocks into
   // the accumulated list. Returns the accumulated last block.
   const closeGroup = () => {
@@ -2232,6 +2282,18 @@ function parseList(lines, i, b, st) {
     // the item width, so an indent-0 code line stays verbatim.
     if (items.length > 0 && items[items.length - 1].state.inFence) {
       const cont = items[items.length - 1];
+      const ind = indentOf(line);
+      // A fence-like line below the item's content indent is NOT item
+      // content: marked's list tokenizer breaks the item on it (it
+      // becomes a top-level fence, which can swallow what follows).
+      // This covers a closing fence at a lower indent and a nested
+      // fence-like line that does not close the open fence.
+      if (!isBlank(line) && ind < cont.width && isFenceLike(line)) break;
+      // The first non-blank content line after a fence opens must reach
+      // the content indent; otherwise the item ends and the fence stays
+      // empty (marked's lazy check: the previous line was a fence
+      // begin). A blank line does not establish the fence.
+      if (cont.state.fenceFresh && !isBlank(line) && ind < cont.width) break;
       const rest = sliceAtCol(expandLeadTabs(line), cont.width);
       cont.lines.push(rest);
       trackLine(cont.state, rest, true);
@@ -2320,7 +2382,7 @@ function parseList(lines, i, b, st) {
       const width = lm2.contentIndent;
       const thresh = lm2.thresh;
       const sub = [lm2.firstContent];
-      const state = { inFence: false, fenceCh: '', fenceLen: 0, endsWithParagraph: false, lastWasBlank: true };
+      const state = { inFence: false, fenceCh: '', fenceLen: 0, fenceFresh: false, endsWithParagraph: false, lastWasBlank: true };
       trackLine(state, sub[0], true);
       items.push({ width, thresh, lines: sub, state });
       j++;
@@ -2652,6 +2714,7 @@ function collectDefs(blocks, st) {
 }
 
 export function parse(src) {
+  docInLink = false;
   const st = { links: new Map(), refs: null, defs: false };
   const lines = normalize(src).split(NL);
   const blocks = parseBlocks(lines, 0, lines.length, st);
