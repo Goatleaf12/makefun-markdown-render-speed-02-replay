@@ -545,35 +545,112 @@ function isEmail(s) {
   return validEmailDomain(s.slice(at + 1));
 }
 
+// Positions of '_'/'*' delimiter runs that pair as emphasis closers,
+// found by a forward scan that skips code spans. Marked lexes emphasis
+// before autolinks, so an email inside _..._ or *...* matches in full
+// (its trailing '_'/'*' is a closer, not part of the address); a
+// trailing '_' that is not a closer backtracks the domain instead.
+function pairedCloserPositions(src) {
+  const paired = new Set();
+  const stack = [];
+  let i = 0;
+  const n = src.length;
+  while (i < n) {
+    const c = src[i];
+    if (c === '`') {
+      let j = i;
+      while (j < n && src[j] === '`') j++;
+      const run = j - i;
+      let k = j, close = -1;
+      while (k < n) {
+        if (src[k] === '`') {
+          let m = k;
+          while (m < n && src[m] === '`') m++;
+          if (m - k === run) { close = k; break; }
+          k = m;
+        } else k++;
+      }
+      if (close === -1) { i = j; continue; }
+      i = close + run;
+      continue;
+    }
+    if (c === '*' || c === '_') {
+      let j = i;
+      while (j < n && src[j] === c) j++;
+      const run = j - i;
+      const info = delimInfo(src, i, run, c);
+      if (info.canClose) {
+        for (let s = stack.length - 1; s >= 0; s--) {
+          const o = stack[s];
+          if (o.ch !== c || !o.canOpen || o.pos === i) continue;
+          if ((o.canOpen && o.canClose) || (info.canOpen && info.canClose)) {
+            const sum = o.n + run;
+            if (sum % 3 === 0 && !(o.n % 3 === 0 && run % 3 === 0)) continue;
+          }
+          paired.add(i);
+          stack.length = s;
+          break;
+        }
+      }
+      if (info.canOpen) stack.push({ ch: c, n: run, canOpen: true, canClose: info.canClose, pos: i });
+      i = j;
+      continue;
+    }
+    i++;
+  }
+  return paired;
+}
+
 // Bare-email autolink spans in src, found before tokenizing so that a
 // '_' inside a local part is never split off as an emphasis delimiter.
-// A trailing '-' or '_' after the matched domain invalidates the whole
-// address (it is literal text, not a link with a trimmed suffix).
+// Implements marked's GFM email regex exactly:
+//   /[A-Za-z0-9._+-]+(@)[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])/
+// The domain backtracks label-by-label so the (?![\w-]) lookahead holds:
+// a trailing '_' or '-' after the domain shortens the match to the last
+// label boundary (first@sprout.example.com_ links first@sprout.example),
+// it does not invalidate the whole address. A trailing '_' that closes
+// emphasis (pairedCloserPositions) does not backtrack at all.
 function findEmails(src) {
   const spans = [];
   let i = 0;
   const n = src.length;
+  const isLocal = (c) => (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 46 || c === 95 || c === 43 || c === 45;
+  const isDom = (c) => (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 45 || c === 95;
+  const isAlnum = (c) => (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+  let closers = null;
+  const isCloser = (p) => {
+    if (src[p] !== '_') return false;
+    if (closers === null) closers = pairedCloserPositions(src);
+    return closers.has(p);
+  };
   while (i < n) {
     const at = src.indexOf('@', i);
     if (at === -1) break;
     let p = at;
-    while (p > 0 && isEmailLocalCode(src.charCodeAt(p - 1))) p--;
+    while (p > 0 && isLocal(src.charCodeAt(p - 1))) p--;
+    if (p === at) { i = at + 1; continue; }
     let q = at + 1;
-    while (q < n) {
-      const code = src.charCodeAt(q);
-      if ((code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 45 || code === 46) q++;
-      else break;
+    while (q < n && isDom(src.charCodeAt(q)) && !isCloser(q)) q++;
+    if (q === at + 1) { i = at + 1; continue; }
+    const ends = [];
+    while (q < n && src.charCodeAt(q) === 46) {
+      let r = q + 1;
+      while (r < n && isDom(src.charCodeAt(r)) && !isCloser(r)) r++;
+      if (r === q + 1 || !isAlnum(src.charCodeAt(r - 1))) break;
+      ends.push(r);
+      q = r;
     }
-    let dom = src.slice(at + 1, q);
-    while (dom.length > 0 && dom[dom.length - 1] === '.') { dom = dom.slice(0, -1); q--; }
-    const after = q < n ? src[q] : '';
-    if (p < at && dom.length > 0 && validEmailDomain(dom) && after !== '-' && after !== '_') {
-      const email = src.slice(p, at) + '@' + dom;
-      spans.push({ start: p, end: at + 1 + dom.length, email });
-      i = at + 1 + dom.length;
-    } else {
-      i = at + 1;
+    if (ends.length === 0) { i = at + 1; continue; }
+    let end = -1;
+    for (let t = ends.length - 1; t >= 0; t--) {
+      const e = ends[t];
+      if (e >= n) { end = e; break; }
+      const c = src.charCodeAt(e);
+      if (isCloser(e) || (!isAlnum(c) && c !== 95 && c !== 45)) { end = e; break; }
     }
+    if (end === -1) { i = at + 1; continue; }
+    spans.push({ start: p, end, email: src.slice(p, end) });
+    i = end;
   }
   return spans;
 }
@@ -846,7 +923,7 @@ function tokenize(src, links, inLink) {
       if (c === '~' && j - i >= 3) { i = j; continue; }
       const info = delimInfo(src, i, j - i, c);
       flushText(i);
-      nodes.push({ t: 2, ch: c, n: j - i, canOpen: info.canOpen, canClose: info.canClose });
+      nodes.push({ t: 2, ch: c, n: j - i, canOpen: info.canOpen, canClose: info.canClose, pos: i });
       i = j;
       textStart = i;
       continue;
@@ -900,13 +977,74 @@ function tokenize(src, links, inLink) {
 // CommonMark delimiter-stack emphasis: closers match the nearest eligible
 // opener, subject to the odd-match rule; a match consumes 1 delimiter (em)
 // or 2 (strong) from each side, leftovers stay and may match again.
-function processEmphasis(nodes) {
+// Marked's emStrong mask: code spans / links / HTML are replaced by
+// '[aaa...]' and escaped punctuation by '++', so delimiters hidden inside
+// them do not count as possible emphasis closers. The masked text keeps
+// the original length, so indices line up with the source.
+const anyPunctOutsideCodeRe = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([\p{P}\p{S}])/gu;
+const blockSkipRe = /\[(?:[^\[\]`]|(?<a>`+)[^`]+\k<a>(?!`))*?\]\((?:\\[\s\S]|[^\\\(\)]|\((?:\\[\s\S]|[^\\\(\)])*\))*\)|(?<!`)()(?<b>`+)[^`]+\k<b>(?!`)|<(?! )[^<>]*?>/g;
+function maskEmStrong(src) {
+  let t = src.replace(anyPunctOutsideCodeRe, (n, s, r) => r ? '+'.repeat(n.length) : s ? s + n.slice(s.length, -s.length).replace(/`/g, '+') + s : n);
+  t = t.replace(blockSkipRe, (n, s, r) => { const o = r ? r.length : 0; return n.slice(0, o) + '[' + 'a'.repeat(n.length - o - 2) + ']'; });
+  return t;
+}
+// Spans [start, end) of the source hidden by marked's blockSkip mask
+// (code spans / links / HTML tags, after the Ot pass). Delimiters inside
+// these spans do not exist for emphasis purposes. The mask preserves
+// length, so spans line up with source indices.
+function maskedSpans(src) {
+  const t = src.replace(anyPunctOutsideCodeRe, (n, s, r) => r ? '+'.repeat(n.length) : s ? s + n.slice(s.length, -s.length).replace(/`/g, '+') + s : n);
+  const spans = [];
+  blockSkipRe.lastIndex = 0;
+  let m;
+  while ((m = blockSkipRe.exec(t)) !== null) spans.push([m.index, m.index + m[0].length]);
+  return spans;
+}
+// Marked's fe(): for each of * _ ~, the start index of the LAST run whose
+// preceding char is not whitespace, in the masked source (-1 if none).
+function lastCloserIdx(masked) {
+  let star = -1, under = -1, tilde = -1;
+  const n = masked.length;
+  for (let s = 0; s < n; s++) {
+    const r = masked[s];
+    if (r !== '*' && r !== '_' && r !== '~') continue;
+    const o = s === 0 ? '\n' : masked[s - 1];
+    let i = s + 1;
+    while (i < n && masked[i] === r) i++;
+    if (o !== ' ' && o !== '\t' && o !== '\n' && o !== '\r' && o !== '\f') {
+      if (r === '*') star = s; else if (r === '_') under = s; else tilde = s;
+    }
+    s = i - 1;
+  }
+  return { '*': star, '_': under, '~': tilde };
+}
+
+function processEmphasis(nodes, src) {
+  // Marked's ze() bound: an opener can only pair if a possible closer for
+  // its char exists at/after the opener's end in the masked source.
+  // (A closer hidden inside a masked code span / link / tag does not count.)
+  let last = null;
+  let spans = null;
+  // Delimiters inside a masked span do not exist for emphasis purposes.
+  for (let k = 0; k < nodes.length; k++) {
+    const nd = nodes[k];
+    if (nd.t !== 2) continue;
+    if (spans === null) spans = maskedSpans(src);
+    const e = nd.pos + nd.n;
+    for (let s = 0; s < spans.length; s++) {
+      if (nd.pos < spans[s][1] && e > spans[s][0]) { nd.canOpen = false; nd.canClose = false; break; }
+    }
+  }
   const stack = [];
   let i = 0;
   while (i < nodes.length) {
     const node = nodes[i];
     if (node.t !== 2) { i++; continue; }
-    if (node.canOpen) stack.push(node);
+    if (node.canOpen) {
+      if (last === null) last = lastCloserIdx(maskEmStrong(src));
+      if (last[node.ch] < node.pos + node.n) node.canOpen = false;
+      else stack.push(node);
+    }
     if (node.canClose) {
       let next = -1;
       for (;;) {
@@ -1018,13 +1156,13 @@ function renderPlain(nodes, links) {
 // stripped, raw HTML is escaped, links and images contribute their text.
 function plainText(src, links) {
   const nodes = tokenize(src, links, false);
-  processEmphasis(nodes);
+  processEmphasis(nodes, src);
   return renderPlain(nodes, links);
 }
 
 function inline(src, links, inLink) {
   const nodes = tokenize(src, links, inLink);
-  processEmphasis(nodes);
+  processEmphasis(nodes, src);
   return renderNodes(nodes, links, inLink);
 }
 
@@ -1187,6 +1325,21 @@ function sliceAtCol(line, targetCol) {
     }
   }
   return line.slice(i);
+}
+
+// Expand a line's leading tabs to spaces (relative to column 0), as
+// marked's list tokenizer does for continuation lines (leadingSpaceTab
+// + J) before stripping the item indent.
+function expandLeadTabs(line) {
+  let i = 0;
+  let col = 0;
+  let out = '';
+  while (i < line.length && (line[i] === ' ' || line[i] === '\t')) {
+    if (line[i] === ' ') { out += ' '; col++; }
+    else { const n = 4 - (col % 4); out += ' '.repeat(n); col += n; }
+    i++;
+  }
+  return out + line.slice(i);
 }
 
 // Strip a block quote prefix ('>' plus one optional space) from a line,
@@ -1518,6 +1671,9 @@ function isDelimRow(line) {
   let b = s.length;
   while (a < b && (s[a] === ' ' || s.charCodeAt(a) === 9)) a++;
   while (b > a && (s[b - 1] === ' ' || s.charCodeAt(b - 1) === 9)) b--;
+  // Marked's table tokenizer requires the delimiter to match /[:|]/:
+  // a bare '---' is a setext underline, not a table delimiter.
+  if (s.slice(a, b).indexOf(':') === -1 && s.slice(a, b).indexOf('|') === -1) return null;
   if (a < b && s[a] === '|') a++;
   if (b > a && s[b - 1] === '|') b--;
   if (a >= b) return null;
@@ -1542,8 +1698,11 @@ function isFenceClose(s, ch, len) {
 
 // Tracks whether the content added so far ends with an open paragraph, for
 // lazy continuation lines. state: { inFence, fenceCh, fenceLen,
-// endsWithParagraph, lastWasBlank }.
-function trackLine(state, rest) {
+// endsWithParagraph, lastWasBlank }. inList is true for list-item content:
+// there, an indented-code line ends the paragraph (marked's list
+// tokenizer stops lazy continuation after a line whose item-text indent
+// is 4+), while in a blockquote it does not.
+function trackLine(state, rest, inList) {
   if (isBlank(rest)) {
     state.endsWithParagraph = false;
     state.lastWasBlank = true;
@@ -1562,7 +1721,7 @@ function trackLine(state, rest) {
     const s0 = rest.slice(firstNonWs(rest));
     if (s0[0] === '>') {
       const savedFence = state.inFence;
-      trackLine(state, stripQuotePrefix(rest));
+      trackLine(state, stripQuotePrefix(rest), inList);
       state.inFence = savedFence;
       return;
     }
@@ -1574,7 +1733,7 @@ function trackLine(state, rest) {
     const lm = matchListMarker(rest);
     if (lm) {
       if (lm.empty) { state.endsWithParagraph = false; state.lastWasBlank = false; return; }
-      trackLine(state, lm.firstContent);
+      trackLine(state, lm.firstContent, inList);
       return;
     }
   }
@@ -1592,6 +1751,11 @@ function trackLine(state, rest) {
   if (isBlockStartLine(rest)) {
     state.endsWithParagraph = false;
   } else if (state.lastWasBlank && indentOf(rest) >= 4) {
+    state.endsWithParagraph = false;
+  } else if (inList && isIndentedCodeStart(rest)) {
+    // In a list item, an indented-code line is a code block, not
+    // paragraph text: it ends lazy continuation (marked's m >= 4
+    // check in the list tokenizer).
     state.endsWithParagraph = false;
   } else {
     state.endsWithParagraph = true;
@@ -1613,35 +1777,63 @@ function neutralizeLazySetext(line, useFourSpaces) {
   return line.slice(0, p) + String.fromCharCode(92) + line.slice(p);
 }
 
-// Strip 4 leading spaces from a lazy line, but only when it starts with
-// 4+ spaces (tabs are left alone).
-function stripLazyIndent(line) {
-  let n = 0;
-  while (n < line.length && line[n] === ' ' && n < 4) n++;
-  if (n === 4) return line.slice(4);
-  return line;
+// Parse one blockquote group's lines as blocks. A quote's inner content
+// is lexed with top=true, so any-start ordered lists do NOT interrupt
+// paragraphs there (that rule applies only inside list items); reset
+// listDepth while parsing a group.
+function parseGroupLines(group, st) {
+  const saved = st.listDepth || 0;
+  st.listDepth = 0;
+  try { return parseBlocks(group, 0, group.length, st); }
+  finally { st.listDepth = saved; }
 }
 
-// The leading blockquote prefix of a line (up to 3 spaces, '>', an
-// optional space, repeated), or '' if the line is not a quote line.
-function quotePrefix(line) {
-  let i = 0;
-  while (i < line.length) {
-    let sp = 0;
-    while (i < line.length && line[i] === ' ' && sp < 3) { i++; sp++; }
-    if (i < line.length && line[i] === '>') {
-      i++;
-      if (i < line.length && line[i] === ' ') i++;
-    } else break;
+// Merge a freshly parsed blockquote group into the accumulated block
+// list, following marked's blockTokens merge rules (top=true inside a
+// quote): an indented code block or a paragraph merges into a preceding
+// paragraph, the code text keeping its trailing newline when more lines
+// follow in the group. The merge chain from the previous group is
+// broken when the group starts with 2+ blank lines (a space token is
+// emitted then); within a group a paragraph merges only as the first
+// block or directly after a merged code block.
+function mergeGroupBlocks(acc, blocks, groupLines) {
+  let leadBlank = 0;
+  while (leadBlank < groupLines.length && isBlank(groupLines[leadBlank])) leadBlank++;
+  let prevMergedCode = false;
+  for (let t = 0; t < blocks.length; t++) {
+    const blk = blocks[t];
+    const last = acc.length > 0 ? acc[acc.length - 1] : null;
+    if (t === 0 && leadBlank < 2 && blk.k === 'code' && blk.indented && last && last.k === 'p') {
+      let ct = blk.text;
+      if (!blk.trail && ct.length > 0 && ct[ct.length - 1] === NL) ct = ct.slice(0, -1);
+      last.text += NL + ct;
+      prevMergedCode = true;
+      continue;
+    }
+    if (blk.k === 'p' && last && last.k === 'p' && (t === 0 ? leadBlank < 2 : prevMergedCode)) {
+      last.text += NL + blk.text;
+      prevMergedCode = false;
+      continue;
+    }
+    acc.push(blk);
+    prevMergedCode = false;
   }
-  return line.slice(0, i);
 }
 
 function parseBlockquote(lines, i, b, st) {
-  const content = [];
+  const acc = [];
+  let group = [];
+  let groupHasQ = false;
   let j = i;
   const state = { inFence: false, fenceCh: '', fenceLen: 0, endsWithParagraph: false, lastWasBlank: true };
-  let prevLazy = false;
+  // Close the current group: parse its lines and merge the blocks into
+  // the accumulated list. Returns the accumulated last block.
+  const closeGroup = () => {
+    if (group.length > 0) mergeGroupBlocks(acc, parseGroupLines(group, st), group);
+    group = [];
+    groupHasQ = false;
+    return acc.length > 0 ? acc[acc.length - 1] : null;
+  };
   while (j < b) {
     const line = lines[j];
     // A truly blank line (no '>' prefix) ends the quote.
@@ -1651,45 +1843,63 @@ function parseBlockquote(lines, i, b, st) {
       const s = line.slice(firstNonWs(line));
       if (s[0] === '>') {
         const rest = stripQuotePrefix(line);
-        content.push(rest);
+        group.push(rest);
+        groupHasQ = true;
         trackLine(state, rest);
-        prevLazy = false;
         j++;
         continue;
       }
     }
-    // Lazy continuation of an open paragraph. A thematic break ends the
-    // quote instead; a level-1 setext underline is paragraph text. If the
-    // paragraph lives inside a nested quote, the lazy line is prefixed
-    // with the same quote markers so it lands in the innermost quote.
-    if (state.endsWithParagraph && !isBlockStartLine(line) && !(ind <= 3 && isHr(line.slice(firstNonWs(line))))) {
-      let add = line;
-      if (!prevLazy) {
-        add = stripLazyIndent(line);
-        if (setextLevel(add) === 1 || isBlockStartLine(add)) {
-          const p = firstNonWs(add);
-          add = add.slice(0, p) + String.fromCharCode(92) + add.slice(p);
+    // Lazy continuation of an open paragraph. Marked's blockquote
+    // tokenizer splits the quote into groups (consecutive '>' lines,
+    // then the lazy lines as a second group, each lexed separately and
+    // merged); the lazy lines are taken raw, so a 4-space lazy line
+    // lexes as indented code and merges into the paragraph with a
+    // blank line, and a setext line lexes as plain paragraph text. A
+    // thematic break or any block start ends the quote instead. If the
+    // current group ends in a nested quote or list, the lazy line joins
+    // that group (the nested container re-lexes with it included); if
+    // it ends in a code block, heading, hr, html block or table, the
+    // quote ends here and the line is not consumed.
+    // Lazy continuation of an open paragraph. Marked's blockquote
+    // regex excludes list-start lines from lazy continuation (Ke):
+    // a bullet or ordered marker followed by a space/tab or end of
+    // line — including a lone '-' (an empty item), which
+    // isBlockStartLine misses because it reads as a setext underline.
+    if (state.endsWithParagraph && !isBlockStartLine(line) && !/^ {0,3}(?:[*+-]|\d{1,9}[.)])(?:[ \t]|$)/.test(line) && !(ind <= 3 && isHr(line.slice(firstNonWs(line))))) {
+      // Marked's blockquoteSetextReplace: a lazy setext-underline line
+      // (0-3 spaces, a run of '=' or '-', only spaces/tabs after) that
+      // is not the first line of its group is indented to 4 spaces, so
+      // it lexes as paragraph text, not a heading underline. A
+      // '>'-prefixed setext line is not neutralized (the '>' blocks
+      // the regex), and a setext line that opens a group stays literal.
+      const neutralize = (l) => group.length > 0 && /^ {0,3}(?:=+|-+)[ \t]*$/.test(l) ? '    ' + l.slice(firstNonWs(l)) : l;
+      if (groupHasQ) {
+        const probe = parseGroupLines(group, st);
+        const probeLast = probe.length > 0 ? probe[probe.length - 1] : null;
+        if (probeLast && (probeLast.k === 'quote' || probeLast.k === 'list')) {
+          group.push(neutralize(line));
+          trackLine(state, line, probeLast.k === 'list');
+          j++;
+          continue;
         }
-      } else if (setextLevel(line) === 1 && indentOf(line) < 4) {
-        add = '    ' + line.slice(firstNonWs(line));
+        mergeGroupBlocks(acc, probe, group);
+        group = [];
+        groupHasQ = false;
+        const accLast = acc.length > 0 ? acc[acc.length - 1] : null;
+        if (accLast && (accLast.k === 'code' || accLast.k === 'h' || accLast.k === 'hr' || accLast.k === 'html' || accLast.k === 'table')) {
+          break;
+        }
       }
-      if (content.length > 0) {
-        const prefix = quotePrefix(content[content.length - 1]);
-        if (prefix !== '') add = prefix + add;
-      }
-      content.push(add);
-      // The lazy line continues the paragraph; do not let trackLine treat
-      // a prefixed (nested-quote) line as a block start.
-      state.endsWithParagraph = true;
-      state.lastWasBlank = false;
-      prevLazy = true;
+      group.push(neutralize(line));
+      trackLine(state, line);
       j++;
       continue;
     }
     break;
   }
-  while (content.length > 0 && content[content.length - 1] === '') content.pop();
-  return { node: { k: 'quote', lines: content }, next: j };
+  closeGroup();
+  return { node: { k: 'quote', blocks: acc }, next: j };
 }
 
 function trimPipes(line) {
@@ -1706,6 +1916,13 @@ function isIndentedCodeStart(line) {
   return indentOf(line) >= 4;
 }
 
+// Strip one indented-code indent (marked's codeRemoveIndent): 1-4
+// spaces, or up to 3 spaces plus a tab.
+function stripCodeIndent(line) {
+  const m = /^(?: {0,3}\t| {1,4})/.exec(line);
+  return m ? line.slice(m[0].length) : line;
+}
+
 function parseParagraph(lines, i, b, st) {
   const paraLines = [];
   let j = i;
@@ -1715,6 +1932,7 @@ function parseParagraph(lines, i, b, st) {
   // once the paragraph turns out not to be a table.
   let tabOnlyIdx = -1;
   let ordIdx = -1;
+  let setextIdx = -1;
   while (j < b) {
     const line = lines[j];
     if (isBlank(line)) {
@@ -1730,7 +1948,12 @@ function parseParagraph(lines, i, b, st) {
       j++;
       continue;
     }
-    if (paraLines.length > 0 && setextLevel(line) > 0) break;
+    // A setext underline line is collected, not a break: inside a
+    // table it is a row (marked's table row pattern excludes only
+    // hr/heading/blockquote/code/fences/list/html, not a lone '='
+    // line). Outside a table it truncates the paragraph (recorded
+    // here, applied below) so the heading path still sees it.
+    if (paraLines.length > 0 && setextLevel(line) > 0 && setextIdx === -1) setextIdx = paraLines.length;
     if (paraLines.length > 0 && interruptsParagraph(line, st)) {
       // An ordered list with a start other than 1 inside a list item
       // interrupts a plain paragraph but is a table row.
@@ -1784,12 +2007,38 @@ function parseParagraph(lines, i, b, st) {
   let cut = -1;
   if (tabOnlyIdx !== -1) cut = tabOnlyIdx;
   if (ordIdx !== -1 && (cut === -1 || ordIdx < cut)) cut = ordIdx;
+  if (setextIdx !== -1 && (cut === -1 || setextIdx < cut)) cut = setextIdx;
   if (cut !== -1) {
     const trunc = paraLines.slice(0, cut);
     rest = stripDefs(trunc.join(NL), st.links);
     if (rest === '') return { node: null, next: i + cut };
     restLines = rest.split(NL);
     j = i + cut;
+  }
+  // Inside a list item, an indented-code line in the middle of a
+  // paragraph is an indented code block merged into the paragraph
+  // text (marked's text-token/code merge): its text is the line with
+  // the code indent stripped, plus a blank line when more paragraph
+  // text follows it. Skipped when a setext underline follows (the
+  // heading path below is already correct there).
+  if (st && st.listDepth > 0 && !(j < b && setextLevel(lines[j]) > 0)) {
+    const out = [];
+    let r = 0;
+    let merged = false;
+    while (r < restLines.length) {
+      if (r >= 1 && isIndentedCodeStart(restLines[r])) {
+        let s = r;
+        while (s < restLines.length && isIndentedCodeStart(restLines[s])) s++;
+        for (let k = r; k < s; k++) out.push(stripCodeIndent(restLines[k]));
+        if (s < restLines.length) out.push('');
+        merged = true;
+        r = s;
+      } else {
+        out.push(restLines[r]);
+        r++;
+      }
+    }
+    if (merged) rest = out.join(NL);
   }
   if (j < b && setextLevel(lines[j]) > 0) {
     // A setext heading strips leading whitespace from its first line and
@@ -1851,9 +2100,9 @@ function parseList(lines, i, b, st) {
       // capped threshold.
       const need = startsWithListMarker(line) ? cont.width : cont.thresh;
       if (indentOf(line) >= need) {
-        const rest = sliceAtCol(line, cont.width);
+        const rest = sliceAtCol(expandLeadTabs(line), cont.width);
         cont.lines.push(rest);
-        trackLine(cont.state, rest);
+        trackLine(cont.state, rest, true);
         j++;
         continue;
       }
@@ -1882,7 +2131,7 @@ function parseList(lines, i, b, st) {
           }
         }
         cont.lines.push(add);
-        trackLine(cont.state, add);
+        trackLine(cont.state, add, true);
         j++;
         continue;
       }
@@ -1895,7 +2144,7 @@ function parseList(lines, i, b, st) {
       const thresh = lm2.thresh;
       const sub = [lm2.firstContent];
       const state = { inFence: false, fenceCh: '', fenceLen: 0, endsWithParagraph: false, lastWasBlank: true };
-      trackLine(state, sub[0]);
+      trackLine(state, sub[0], true);
       items.push({ width, thresh, lines: sub, state });
       j++;
       continue;
@@ -1959,6 +2208,11 @@ function parseBlocks(lines, a, b, st) {
     if (ind <= 3) {
       const fence = fenceInfo(s);
       if (fence && !(fence.ch === '`' && fence.info.indexOf('`') !== -1)) {
+        // marked's Dt (indentCodeCompensation): for a backtick fence
+        // whose opening line has leading whitespace, strip up to that
+        // many leading whitespace CHARACTERS from each content line
+        // that starts with whitespace. Tilde fences are verbatim.
+        const stripN = fence.ch === '`' ? firstNonWs(line) : 0;
         const content = [];
         let j = i + 1;
         while (j < b) {
@@ -1973,9 +2227,12 @@ function parseBlocks(lines, a, b, st) {
               if (k >= fence.len && isAllWs(s2.slice(k))) break;
             }
           }
-          // Fenced code content is verbatim: marked does not strip the
-          // fence's indent (tabs stay tabs, leading spaces stay).
-          content.push(l2);
+          let cl = l2;
+          if (stripN > 0) {
+            const m = /^[ \t]+/.exec(l2);
+            if (m) cl = l2.slice(Math.min(m[0].length, stripN));
+          }
+          content.push(cl);
           j++;
         }
         out.push({ k: 'code', lang: unescapePunct(langOf(fence.info)), text: content.length > 0 ? content.join(NL) + (content[content.length - 1] !== '' ? NL : '') : '' });
@@ -2081,7 +2338,7 @@ function parseBlocks(lines, a, b, st) {
         j++;
       }
       while (content.length > 0 && isAllWs(content[content.length - 1])) content.pop();
-      out.push({ k: 'code', lang: '', text: content.length > 0 ? content.join(NL) + NL : '' });
+      out.push({ k: 'code', lang: '', text: content.length > 0 ? content.join(NL) + NL : '', indented: true, trail: j < b });
       i = j;
       continue;
     }
@@ -2173,7 +2430,7 @@ function renderNode(blk, st) {
     case 'hr':
       return `<hr>\n`;
     case 'quote':
-      return `<blockquote>\n${renderBlocks(parseBlocks(blk.lines, 0, blk.lines.length, st), st)}</blockquote>\n`;
+      return `<blockquote>\n${renderBlocks(blk.blocks, st)}</blockquote>\n`;
     case 'list':
       return renderList(blk, st);
     case 'html':
@@ -2214,7 +2471,7 @@ function collectDefs(blocks, st) {
   for (let i = 0; i < blocks.length; i++) {
     const blk = blocks[i];
     if (blk.k === 'quote') {
-      collectDefs(parseBlocks(blk.lines, 0, blk.lines.length, st), st);
+      collectDefs(blk.blocks, st);
     } else if (blk.k === 'list') {
       for (let t = 0; t < blk.items.length; t++) {
         // Item contents are parsed with list context (any-start ordered
